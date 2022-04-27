@@ -5,17 +5,14 @@
 // https://github.com/softprops/lambda-rust/
 
 const { spawnSync } = require("child_process");
-const { homedir, platform } = require("os");
+const { homedir } = require("os");
 const path = require("path");
-const AdmZip = require("adm-zip");
-const { mkdirSync, writeFileSync, readFileSync } = require("fs");
 
 const DEFAULT_DOCKER_TAG = "latest";
 const DEFAULT_DOCKER_IMAGE = "softprops/lambda-rust";
 const RUST_RUNTIME = "rust";
 const BASE_RUNTIME = "provided.al2";
 const NO_OUTPUT_CAPTURE = { stdio: ["ignore", process.stdout, process.stderr] };
-const MUSL_PLATFORMS = ["darwin", "win32", "linux"];
 
 function includeInvokeHook(serverlessVersion) {
   let [major, minor] = serverlessVersion.split(".");
@@ -65,114 +62,8 @@ class RustPlugin {
     this.serverless.service.package.excludeDevDependencies = false;
   }
 
-  localBuildArgs(funcArgs, cargoPackage, binary, profile, platform) {
-    const defaultArgs = ["build", "-p", cargoPackage];
-    const profileArgs = profile !== "dev" ? ["--release"] : [];
-    const cargoFlags = (
-      (funcArgs || {}).cargoFlags ||
-      this.custom.cargoFlags ||
-      ""
-    ).split(/\s+/);
-    const targetArgs = MUSL_PLATFORMS.includes(platform)
-      ? ["--target", "x86_64-unknown-linux-musl"]
-      : [];
-    return [
-      ...defaultArgs,
-      ...profileArgs,
-      ...targetArgs,
-      ...cargoFlags,
-    ].filter((i) => i);
-  }
-
-  localBuildEnv(env, platform) {
-    const defaultEnv = { ...env };
-    const platformEnv =
-      "win32" === platform
-        ? {
-            RUSTFLAGS: (env["RUSTFLAGS"] || "") + " -Clinker=rust-lld",
-            TARGET_CC: "rust-lld",
-            CC_x86_64_unknown_linux_musl: "rust-lld",
-          }
-        : "darwin" === platform
-        ? {
-            RUSTFLAGS:
-              (env["RUSTFLAGS"] || "") + " -Clinker=x86_64-linux-musl-gcc",
-            TARGET_CC: "x86_64-linux-musl-gcc",
-            CC_x86_64_unknown_linux_musl: "x86_64-linux-musl-gcc",
-          }
-        : {};
-    return {
-      ...defaultEnv,
-      ...platformEnv,
-    };
-  }
-
-  localSourceDir(profile, platform) {
-    let executable = "target";
-    if (MUSL_PLATFORMS.includes(platform)) {
-      executable = path.join(executable, "x86_64-unknown-linux-musl");
-    }
-    return path.join(executable, profile !== "dev" ? "release" : "debug");
-  }
-
-  localArtifactDir(profile) {
-    return path.join(
-      "target",
-      "lambda",
-      profile !== "dev" ? "release" : "debug"
-    );
-  }
-
-  localBuild(funcArgs, cargoPackage, binary, profile) {
-    const args = this.localBuildArgs(
-      funcArgs,
-      cargoPackage,
-      binary,
-      profile,
-      platform()
-    );
-
-    const env = this.localBuildEnv(process.env, platform());
-    this.serverless.cli.log(`Running local cargo build on ${platform()}`);
-
-    const buildResult = spawnSync("cargo", args, {
-      ...NO_OUTPUT_CAPTURE,
-      ...{
-        env: env,
-      },
-    });
-    if (buildResult.error || buildResult.status > 0) {
-      return buildResult;
-    }
-    // now rename binary and zip
-    const sourceDir = this.localSourceDir(profile, platform());
-    const zip = new AdmZip();
-    zip.addFile(
-      "bootstrap",
-      readFileSync(path.join(sourceDir, binary)),
-      "",
-      0x755 << 16
-    );
-    const targetDir = this.localArtifactDir(profile);
-    try {
-      mkdirSync(targetDir, { recursive: true });
-    } catch {}
-    try {
-      writeFileSync(path.join(targetDir, `${binary}.zip`), zip.toBuffer());
-      return {};
-    } catch (err) {
-      this.serverless.cli.log(`Error zipping artifact ${err}`);
-      return {
-        err: err,
-        status: 1,
-      };
-    }
-  }
-
   dockerBuildArgs(
-    funcArgs,
     cargoPackage,
-    binary,
     profile,
     srcPath,
     cargoRegistry,
@@ -184,7 +75,6 @@ class RustPlugin {
       "--rm",
       "-t",
       "-e",
-      `BIN=${binary}`,
       `-v`,
       `${srcPath}:/code`,
       `-v`,
@@ -193,7 +83,7 @@ class RustPlugin {
       `${cargoDownloads}:/cargo/git`,
     ];
     const customArgs = (env["SLS_DOCKER_ARGS"] || "").split(" ") || [];
-    let cargoFlags = (funcArgs || {}).cargoFlags || this.custom.cargoFlags;
+    let cargoFlags = this.custom.cargoFlags;
     if (profile) {
       // release or dev
       customArgs.push("-e", `PROFILE=${profile}`);
@@ -209,26 +99,22 @@ class RustPlugin {
       // --features awesome-feature, ect
       customArgs.push("-e", `CARGO_FLAGS=${cargoFlags}`);
     }
-    const dockerTag = (funcArgs || {}).dockerTag || this.custom.dockerTag;
-    const dockerImage = (funcArgs || {}).dockerImage || this.custom.dockerImage;
 
     return [
       ...defaultArgs,
       ...customArgs,
-      `${dockerImage}:${dockerTag}`,
+      `${this.custom.dockerTag}:${this.custom.dockerImage}`,
     ].filter((i) => i);
   }
 
-  dockerBuild(funcArgs, cargoPackage, binary, profile) {
+  dockerBuild(cargoPackage, profile) {
     const cargoHome = process.env.CARGO_HOME || path.join(homedir(), ".cargo");
     const cargoRegistry = path.join(cargoHome, "registry");
     const cargoDownloads = path.join(cargoHome, "git");
 
     const dockerCLI = process.env["SLS_DOCKER_CLI"] || "docker";
     const args = this.dockerBuildArgs(
-      funcArgs,
       cargoPackage,
-      binary,
       profile,
       this.srcPath,
       cargoRegistry,
@@ -249,18 +135,6 @@ class RustPlugin {
     }
   }
 
-  cargoBinary(func) {
-    let [cargoPackage, binary] = func.handler.split(".");
-    if (binary == undefined) {
-      binary = cargoPackage;
-    }
-    return { cargoPackage, binary };
-  }
-
-  buildLocally(func) {
-    return (func.rust || {}).dockerless || this.custom.dockerless;
-  }
-
   /** the entry point for building functions */
   build() {
     const service = this.serverless.service;
@@ -276,20 +150,25 @@ class RustPlugin {
         return;
       }
       rustFunctionsFound = true;
-      const { cargoPackage, binary } = this.cargoBinary(func);
+    });
+    if (!rustFunctionsFound) {
+      throw new Error(
+        `Error: no Rust functions found. ` +
+          `Use 'runtime: ${RUST_RUNTIME}' in global or ` +
+          `function configuration to use this plugin.`
+      );
+    }
 
-      this.serverless.cli.log(`Building Rust ${func.handler} func...`);
-      let profile = (func.rust || {}).profile || this.custom.profile;
-
-      const res = this.buildLocally(func)
-        ? this.localBuild(func.rust, cargoPackage, binary, profile)
-        : this.dockerBuild(func.rust, cargoPackage, binary, profile);
-      if (res.error || res.status > 0) {
-        this.serverless.cli.log(
-          `Rust build encountered an error: ${res.error} ${res.status}.`
-        );
-        throw new Error(res.error);
-      }
+    const res = this.dockerBuild(this.custom.cargoPackage, this.custom.profile);
+    if (res.error || res.status > 0) {
+      this.serverless.cli.log(
+        `Rust build encountered an error: ${res.error} ${res.status}.`
+      );
+      throw new Error(res.error);
+    }
+    
+    this.functions().forEach((funcName) => {
+      const func = service.getFunction(funcName);
       // If all went well, we should now have find a packaged compiled binary under `target/lambda/release`.
       //
       // The AWS "provided" lambda runtime requires executables to be named
@@ -314,13 +193,6 @@ class RustPlugin {
     });
     if (service.provider.runtime === RUST_RUNTIME) {
       service.provider.runtime = BASE_RUNTIME;
-    }
-    if (!rustFunctionsFound) {
-      throw new Error(
-        `Error: no Rust functions found. ` +
-          `Use 'runtime: ${RUST_RUNTIME}' in global or ` +
-          `function configuration to use this plugin.`
-      );
     }
   }
 }
