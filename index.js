@@ -74,7 +74,6 @@ class RustPlugin {
       "run",
       "--rm",
       "-t",
-      "-e",
       `-v`,
       `${srcPath}:/code`,
       `-v`,
@@ -103,7 +102,7 @@ class RustPlugin {
     return [
       ...defaultArgs,
       ...customArgs,
-      `${this.custom.dockerTag}:${this.custom.dockerImage}`,
+      `${this.custom.dockerImage}:${this.custom.dockerTag}`,
     ].filter((i) => i);
   }
 
@@ -180,8 +179,8 @@ class RustPlugin {
       // for more information
       const artifactPath = path.join(
         this.srcPath,
-        `target/lambda/${"dev" === profile ? "debug" : "release"}`,
-        `${binary}.zip`
+        `target/lambda/${"dev" === this.custom.profile ? "debug" : "release"}`,
+        `${func.handler}.zip`
       );
       func.package = func.package || {};
       func.package.artifact = artifactPath;
